@@ -1,0 +1,8 @@
+# Generated per user: window position, chosen metrics, thresholds.
+config.json
+
+# Optional third-party frame-timing tool, fetched by the user, not vendored.
+presentmon/
+
+__pycache__/
+*.pyc
