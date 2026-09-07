@@ -54,6 +54,9 @@ DEFAULT_CONFIG = {
     "locked": False,
     "click_through": False,
     "click_through_hotkey": "G",     # Ctrl+Shift+<this> toggles click-through
+    # None means "adopt whatever the Startup folder already says" on first run;
+    # after that it is a real True/False and the shortcut is kept to match.
+    "start_on_login": None,
     "show_sparklines": True,
     "sparkline_points": 90,
     "show_title": True,
@@ -146,6 +149,77 @@ def save_config(cfg: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(cfg, handle, indent=2)
     os.replace(tmp, CONFIG_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Start at logon
+# ---------------------------------------------------------------------------
+
+# Same shortcut name the Add/Remove .bat files use, so the menu toggle and the
+# scripts drive one mechanism rather than two that can disagree.
+STARTUP_LINK_NAME = "GPU Overlay.lnk"
+
+
+def startup_link_path() -> str:
+    appdata = os.environ.get("APPDATA", "")
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu",
+                        "Programs", "Startup", STARTUP_LINK_NAME)
+
+
+def startup_enabled() -> bool:
+    """True when the logon shortcut is actually present on disk."""
+    return IS_WINDOWS and os.path.exists(startup_link_path())
+
+
+def _pythonw() -> str:
+    """The windowed interpreter, so the logon launch shows no console."""
+    exe = sys.executable or "pythonw.exe"
+    base = os.path.basename(exe).lower()
+    if base == "python.exe":
+        candidate = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(candidate):
+            return candidate
+    return exe
+
+
+def set_startup(enable: bool) -> bool:
+    """Create or delete the logon shortcut. Returns the resulting state.
+
+    The shortcut points straight at pythonw.exe rather than at the .bat, so it
+    survives the .bat being renamed and never flashes a console window.
+    """
+    if not IS_WINDOWS:
+        return False
+    link = startup_link_path()
+    try:
+        if not enable:
+            if os.path.exists(link):
+                os.remove(link)
+            return False
+        script = os.path.abspath(__file__)
+        # WScript.Shell is the only stdlib-free way to write a .lnk; -1 window
+        # style is "normal", and pythonw has no window to style anyway.
+        ps = (
+            "$s = (New-Object -ComObject WScript.Shell).CreateShortcut({0});"
+            "$s.TargetPath = {1};"
+            "$s.Arguments = {2};"
+            "$s.WorkingDirectory = {3};"
+            "$s.Description = 'GPU Overlay';"
+            "$s.Save()"
+        ).format(_ps_quote(link), _ps_quote(_pythonw()),
+                 _ps_quote('"%s"' % script), _ps_quote(HERE))
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                        "-Command", ps],
+                       creationflags=NO_WINDOW, timeout=20,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    return startup_enabled()
+
+
+def _ps_quote(value: str) -> str:
+    """Single-quoted PowerShell literal; '' escapes an embedded quote."""
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +895,8 @@ class Overlay(tk.Tk):
         self.bind_all("<Button-3>", self.on_menu, add="+")
         self.bind_all("<Escape>", lambda _e: self.shutdown())
 
+        self.reconcile_startup()
+
         self.after(120, self.tick)
         self.after(400, self.guard_click_through)
         self.after(200, self.assert_on_top)
@@ -1027,6 +1103,11 @@ class Overlay(tk.Tk):
             label=f"Click-through  (Ctrl+Shift+{letter} to toggle back)",
             variable=tk.BooleanVar(value=self.cfg.get("click_through", False)),
             command=self.toggle_click_through)
+        if IS_WINDOWS:
+            menu.add_checkbutton(
+                label="Start with Windows",
+                variable=tk.BooleanVar(value=startup_enabled()),
+                command=self.toggle_startup)
         menu.add_separator()
         menu.add_command(label="Edit config.json", command=self.open_config)
         menu.add_command(label="Reload config", command=self.reload_config)
@@ -1039,6 +1120,29 @@ class Overlay(tk.Tk):
         finally:
             menu.grab_release()
             self._menu_open = False
+
+    def reconcile_startup(self) -> None:
+        """Make the Startup shortcut agree with `start_on_login`.
+
+        A null setting means the key has never been decided, so the shortcut on
+        disk wins and is written back - that adopts an existing shortcut made by
+        "Add to Startup.bat" instead of silently deleting it. Once the key holds
+        a real boolean it is authoritative, so editing config.json by hand or
+        toggling from the menu both take effect at the next launch.
+        """
+        if not IS_WINDOWS:
+            return
+        want = self.cfg.get("start_on_login")
+        if want is None:
+            self.cfg["start_on_login"] = startup_enabled()
+            self.persist()
+            return
+        if bool(want) != startup_enabled():
+            self.cfg["start_on_login"] = set_startup(bool(want))
+            self.persist()
+
+    def toggle_startup(self) -> None:
+        self.set_and_save(["start_on_login"], set_startup(not startup_enabled()))
 
     def toggle_click_through(self) -> None:
         self.set_and_save(["click_through"],

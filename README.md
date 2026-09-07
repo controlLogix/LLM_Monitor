@@ -50,12 +50,28 @@ Optional:
     Start GPU Overlay.bat
 
 That launches under `pythonw.exe`, so no console window appears.
-`Add to Startup.bat` places a shortcut in the current user's Startup folder and
-`Remove from Startup.bat` removes it again.
 
 To run it directly:
 
     pythonw gpu_overlay.pyw
+
+### Starting at logon
+
+Tick **Start with Windows** in the right-click menu. That places a shortcut in
+the current user's Startup folder and records the choice as `start_on_login` in
+`config.json`; unticking removes both. `Add to Startup.bat` and
+`Remove from Startup.bat` do the same job from outside the overlay and update
+the same key, so the menu always reflects the true state.
+
+The key ships as `null`, meaning undecided. On first run the overlay adopts
+whatever the Startup folder already holds, so a shortcut left by an earlier
+version is kept rather than quietly deleted. From then on the key is
+authoritative: set it to `true` or `false` by hand and the shortcut is created
+or removed at the next launch.
+
+The shortcut targets `pythonw.exe` with the script path rather than the .bat, so
+nothing flashes a console at logon. It stores an absolute path, so after moving
+the folder, retick the setting (or rerun `Add to Startup.bat`) to repoint it.
 
 ## Controls
 
@@ -186,6 +202,7 @@ Keys beyond the menu items:
     "fit_context_reserve_gb": 1.5,  // VRAM withheld from the fit estimate
     "ollama_url": "http://localhost:11434",
     "click_through_hotkey": "G",
+    "start_on_login": null,         // true | false | null to follow the folder
     "fps_backend": "auto",          // auto | presentmon | nvenc | off
     "fps_window_s": 1.5,
     "warn": { "temp_warn": 78, "temp_crit": 86 },
