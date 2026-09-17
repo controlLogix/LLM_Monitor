@@ -73,6 +73,19 @@ The shortcut targets `pythonw.exe` with the script path rather than the .bat, so
 nothing flashes a console at logon. It stores an absolute path, so after moving
 the folder, retick the setting (or rerun `Add to Startup.bat`) to repoint it.
 
+Both the menu toggle and `Add to Startup.bat` resolve the interpreter to a full
+path before writing the shortcut, rather than recording a bare `pythonw.exe`. On
+a Microsoft Store install that bare name is an App Execution Alias stub, which is
+per-user and can be switched off under Settings > Apps > Advanced app settings >
+App execution aliases - not a thing a logon shortcut should hang off. The
+resolved path is the versionless `WindowsApps\PythonSoftwareFoundation.*` alias
+directory, so it survives a Python point release.
+
+If the overlay stops coming up at logon, check both halves: the shortcut is
+present in the Startup folder, and `start_on_login` is `true` in `config.json`.
+The key is authoritative once set, so a stale `false` makes the overlay delete
+the shortcut again on its next launch.
+
 ## Controls
 
 | Action | How |

@@ -6,3 +6,6 @@ presentmon/
 
 __pycache__/
 *.pyc
+
+# Local safety copies of the generated config.
+config.json.bak*
