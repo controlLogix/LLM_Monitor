@@ -11,6 +11,9 @@ Config:   config.json next to this file (auto-created, hot-reloadable)
 Move:     left-click drag anywhere on the panel
 Menu:     right-click the panel
 Escape:   hold Ctrl+Shift to regain the mouse while click-through is on
+Tray:     left-click the notification-area icon toggles click-through,
+          right-click it for a menu that works even while the panel ignores
+          the mouse
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -54,6 +58,7 @@ DEFAULT_CONFIG = {
     "locked": False,
     "click_through": False,
     "click_through_hotkey": "G",     # Ctrl+Shift+<this> toggles click-through
+    "tray_icon": True,               # notification-area icon: left-click toggles click-through
     # None means "adopt whatever the Startup folder already says" on first run;
     # after that it is a real True/False and the shortcut is kept to match.
     "start_on_login": None,
@@ -941,6 +946,285 @@ def visible_origin(x, y, w, h):
 
 
 # ---------------------------------------------------------------------------
+# Notification-area (tray) icon - a way back that never needs the panel
+# ---------------------------------------------------------------------------
+
+TRAY_TOGGLE, TRAY_LOCK, TRAY_SHOW, TRAY_STARTUP, TRAY_CONFIG, TRAY_RELOAD, TRAY_QUIT = range(1, 8)
+
+# Bar colors for the icon: interactive, click-through, hidden.
+TRAY_COLORS = {"live": (74, 222, 128), "through": (245, 158, 11), "hidden": (140, 140, 140)}
+
+
+class TrayIcon:
+    """
+    A Shell_NotifyIcon on its own thread, with its own hidden window and
+    message loop.
+
+    Click-through makes the panel ignore the mouse, so its right-click menu is
+    unreachable unless the hotkey is remembered. The tray icon is always
+    clickable: left-click toggles click-through, right-click opens a native
+    menu. Tk is not thread-safe, so this thread never touches a widget - chosen
+    commands go on a queue that the Tk loop drains. `state_fn` is only read.
+    """
+
+    WM_TRAY = 0x8000 + 1        # WM_APP + 1: icon callback
+    WM_REFRESH = 0x8000 + 2     # WM_APP + 2: redraw icon + tooltip
+
+    def __init__(self, state_fn) -> None:
+        self.commands: queue.Queue = queue.Queue()
+        self._state_fn = state_fn
+        self._hwnd = None
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="tray", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+        self._ready.wait(2.0)
+
+    def refresh(self) -> None:
+        if self._hwnd:
+            self._user32.PostMessageW(self._hwnd, self.WM_REFRESH, 0, 0)
+
+    def stop(self) -> None:
+        if self._hwnd:
+            self._user32.PostMessageW(self._hwnd, 0x0010, 0, 0)   # WM_CLOSE
+            self._thread.join(1.0)
+
+    # -- tray thread -------------------------------------------------------
+
+    def _run(self) -> None:
+        try:
+            self._loop()
+        except Exception:
+            self._hwnd = None
+        finally:
+            self._ready.set()
+
+    def _bind(self):
+        """Private WinDLL instances so these argtypes never leak into the
+        ctypes.windll calls the rest of the file makes."""
+        from ctypes import wintypes as wt
+        self.wt = wt
+        user32 = ctypes.WinDLL("user32")
+        shell32 = ctypes.WinDLL("shell32")
+        gdi32 = ctypes.WinDLL("gdi32")
+        kernel32 = ctypes.WinDLL("kernel32")
+        self.LRESULT = ctypes.c_ssize_t
+        self.WNDPROC = ctypes.WINFUNCTYPE(self.LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [("style", wt.UINT), ("lpfnWndProc", self.WNDPROC),
+                        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                        ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                        ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH),
+                        ("lpszMenuName", wt.LPCWSTR), ("lpszClassName", wt.LPCWSTR)]
+
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [("cbSize", wt.DWORD), ("hWnd", wt.HWND), ("uID", wt.UINT),
+                        ("uFlags", wt.UINT), ("uCallbackMessage", wt.UINT),
+                        ("hIcon", wt.HICON), ("szTip", wt.WCHAR * 128),
+                        ("dwState", wt.DWORD), ("dwStateMask", wt.DWORD),
+                        ("szInfo", wt.WCHAR * 256), ("uVersion", wt.UINT),
+                        ("szInfoTitle", wt.WCHAR * 64), ("dwInfoFlags", wt.DWORD),
+                        ("guidItem", ctypes.c_ubyte * 16), ("hBalloonIcon", wt.HICON)]
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
+                        ("biPlanes", wt.WORD), ("biBitCount", wt.WORD),
+                        ("biCompression", wt.DWORD), ("biSizeImage", wt.DWORD),
+                        ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG),
+                        ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD)]
+
+        class ICONINFO(ctypes.Structure):
+            _fields_ = [("fIcon", wt.BOOL), ("xHotspot", wt.DWORD), ("yHotspot", wt.DWORD),
+                        ("hbmMask", wt.HBITMAP), ("hbmColor", wt.HBITMAP)]
+
+        self.WNDCLASSW, self.NOTIFYICONDATAW = WNDCLASSW, NOTIFYICONDATAW
+        self.BITMAPINFOHEADER, self.ICONINFO = BITMAPINFOHEADER, ICONINFO
+
+        def sig(fn, res, *args):
+            fn.restype, fn.argtypes = res, list(args)
+
+        sig(user32.DefWindowProcW, self.LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+        sig(user32.RegisterClassW, wt.ATOM, ctypes.c_void_p)
+        sig(user32.CreateWindowExW, wt.HWND, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID)
+        sig(user32.DestroyWindow, wt.BOOL, wt.HWND)
+        sig(user32.PostMessageW, wt.BOOL, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+        sig(user32.PostQuitMessage, None, ctypes.c_int)
+        sig(user32.GetMessageW, wt.BOOL, ctypes.c_void_p, wt.HWND, wt.UINT, wt.UINT)
+        sig(user32.TranslateMessage, wt.BOOL, ctypes.c_void_p)
+        sig(user32.DispatchMessageW, self.LRESULT, ctypes.c_void_p)
+        sig(user32.RegisterWindowMessageW, wt.UINT, wt.LPCWSTR)
+        sig(user32.CreatePopupMenu, wt.HMENU)
+        sig(user32.AppendMenuW, wt.BOOL, wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR)
+        sig(user32.SetMenuDefaultItem, wt.BOOL, wt.HMENU, wt.UINT, wt.UINT)
+        sig(user32.TrackPopupMenu, wt.BOOL, wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, wt.HWND, ctypes.c_void_p)
+        sig(user32.DestroyMenu, wt.BOOL, wt.HMENU)
+        sig(user32.GetCursorPos, wt.BOOL, ctypes.c_void_p)
+        sig(user32.SetForegroundWindow, wt.BOOL, wt.HWND)
+        sig(user32.GetDC, wt.HDC, wt.HWND)
+        sig(user32.ReleaseDC, ctypes.c_int, wt.HWND, wt.HDC)
+        sig(user32.CreateIconIndirect, wt.HICON, ctypes.c_void_p)
+        sig(user32.DestroyIcon, wt.BOOL, wt.HICON)
+        sig(shell32.Shell_NotifyIconW, wt.BOOL, wt.DWORD, ctypes.c_void_p)
+        sig(gdi32.CreateDIBSection, wt.HBITMAP, wt.HDC, ctypes.c_void_p, wt.UINT,
+            ctypes.POINTER(ctypes.c_void_p), wt.HANDLE, wt.DWORD)
+        sig(gdi32.CreateBitmap, wt.HBITMAP, ctypes.c_int, ctypes.c_int, wt.UINT, wt.UINT,
+            ctypes.c_void_p)
+        sig(gdi32.DeleteObject, wt.BOOL, wt.HGDIOBJ)
+        sig(kernel32.GetModuleHandleW, wt.HMODULE, wt.LPCWSTR)
+        self._user32, self._shell32, self._gdi32 = user32, shell32, gdi32
+        return kernel32
+
+    def _make_icon(self, rgb):
+        """A 32x32 dark rounded tile with three meter bars in `rgb`."""
+        size = 32
+        pixels = bytearray(size * size * 4)
+        lo, hi, r = 1, 30, 6
+        bars = ((7, 12, 8), (14, 19, 13), (21, 26, 18))   # x0, x1, height
+        for y in range(size):
+            for x in range(size):
+                cx = min(max(x, lo + r), hi - r)
+                cy = min(max(y, lo + r), hi - r)
+                if not (lo <= x <= hi and lo <= y <= hi
+                        and (x - cx) ** 2 + (y - cy) ** 2 <= r * r):
+                    continue
+                color = (27, 31, 36)
+                for x0, x1, h in bars:
+                    if x0 <= x < x1 and 26 - h <= y < 26:
+                        color = rgb
+                i = (y * size + x) * 4
+                pixels[i:i + 4] = bytes((color[2], color[1], color[0], 255))   # BGRA
+
+        bmi = self.BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(bmi)
+        bmi.biWidth, bmi.biHeight = size, -size        # negative = top-down
+        bmi.biPlanes, bmi.biBitCount = 1, 32
+        bits = ctypes.c_void_p()
+        hdc = self._user32.GetDC(None)
+        color_bmp = self._gdi32.CreateDIBSection(hdc, ctypes.byref(bmi), 0,
+                                                 ctypes.byref(bits), None, 0)
+        self._user32.ReleaseDC(None, hdc)
+        ctypes.memmove(bits, bytes(pixels), len(pixels))
+        mask_bits = (ctypes.c_ubyte * (size * size // 8))()
+        mask_bmp = self._gdi32.CreateBitmap(size, size, 1, 1, mask_bits)
+
+        info = self.ICONINFO(True, 0, 0, mask_bmp, color_bmp)
+        icon = self._user32.CreateIconIndirect(ctypes.byref(info))
+        self._gdi32.DeleteObject(mask_bmp)
+        self._gdi32.DeleteObject(color_bmp)
+        return icon
+
+    def _notify(self, action: int) -> None:
+        state = self._state_fn()
+        if state["hidden"]:
+            key, mode = "hidden", "hidden"
+        elif state["click_through"]:
+            key, mode = "through", "click-through ON"
+        else:
+            key, mode = "live", "click-through off"
+        data = self.NOTIFYICONDATAW()
+        data.cbSize = ctypes.sizeof(data)
+        data.hWnd = self._hwnd
+        data.uID = 1
+        data.uFlags = 0x1 | 0x2 | 0x4                 # NIF_MESSAGE | NIF_ICON | NIF_TIP
+        data.uCallbackMessage = self.WM_TRAY
+        data.hIcon = self._icons[key]
+        data.szTip = f"{APP_NAME} - {mode}\nLeft-click: toggle click-through"[:127]
+        self._shell32.Shell_NotifyIconW(action, ctypes.byref(data))
+
+    def _popup(self, hwnd) -> None:
+        state = self._state_fn()
+        user32 = self._user32
+        MF_CHECKED, MF_SEPARATOR = 0x8, 0x800
+        menu = user32.CreatePopupMenu()
+
+        def add(cmd, label, checked=False):
+            user32.AppendMenuW(menu, MF_CHECKED if checked else 0, cmd, label)
+
+        add(TRAY_TOGGLE, f"Click-through\tCtrl+Shift+{state['letter']}", state["click_through"])
+        add(TRAY_LOCK, "Lock position", state["locked"])
+        add(TRAY_SHOW, "Show overlay" if state["hidden"] else "Hide overlay")
+        if state["startup"] is not None:
+            add(TRAY_STARTUP, "Start with Windows", state["startup"])
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        add(TRAY_CONFIG, "Edit config.json")
+        add(TRAY_RELOAD, "Reload config")
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        add(TRAY_QUIT, "Quit")
+        user32.SetMenuDefaultItem(menu, TRAY_TOGGLE, 0)
+
+        point = self.wt.POINT()
+        user32.GetCursorPos(ctypes.byref(point))
+        # Without the foreground switch the menu never dismisses on an outside
+        # click; the trailing WM_NULL is the documented companion fix.
+        user32.SetForegroundWindow(hwnd)
+        cmd = user32.TrackPopupMenu(menu, 0x0100 | 0x0002 | 0x0080,   # RETURNCMD|RIGHTBUTTON|NONOTIFY
+                                    point.x, point.y, 0, hwnd, None)
+        user32.PostMessageW(hwnd, 0, 0, 0)
+        user32.DestroyMenu(menu)
+        if cmd:
+            self.commands.put(cmd)
+
+    def _loop(self) -> None:
+        kernel32 = self._bind()
+        user32 = self._user32
+        taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
+
+        def wndproc(hwnd, msg, wparam, lparam):
+            if msg == self.WM_TRAY:
+                event = lparam & 0xFFFF
+                if event == 0x0202:                       # WM_LBUTTONUP
+                    self.commands.put(TRAY_TOGGLE)
+                elif event in (0x0205, 0x007B):           # WM_RBUTTONUP, WM_CONTEXTMENU
+                    self._popup(hwnd)
+                return 0
+            if msg == self.WM_REFRESH:
+                self._notify(1)                           # NIM_MODIFY
+                return 0
+            if msg == taskbar_created and taskbar_created:
+                self._notify(0)                           # Explorer restarted: NIM_ADD again
+                return 0
+            if msg == 0x0010:                             # WM_CLOSE
+                self._notify(2)                           # NIM_DELETE
+                user32.DestroyWindow(hwnd)
+                return 0
+            if msg == 0x0002:                             # WM_DESTROY
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self._wndproc = self.WNDPROC(wndproc)             # keep alive for the callback
+        instance = kernel32.GetModuleHandleW(None)
+        cls = self.WNDCLASSW()
+        cls.lpfnWndProc = self._wndproc
+        cls.hInstance = instance
+        cls.lpszClassName = "GpuOverlayTray"
+        user32.RegisterClassW(ctypes.byref(cls))
+        # A real (never shown) top-level window, not a message-only one, so it
+        # still receives the TaskbarCreated broadcast after an Explorer restart.
+        hwnd = user32.CreateWindowExW(0, "GpuOverlayTray", APP_NAME, 0,
+                                      0, 0, 0, 0, None, None, instance, None)
+        if not hwnd:
+            return
+        self._icons = {k: self._make_icon(v) for k, v in TRAY_COLORS.items()}
+        self._hwnd = hwnd
+        self._notify(0)                                   # NIM_ADD
+        self._ready.set()
+
+        msg = self.wt.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        self._hwnd = None
+        for icon in self._icons.values():
+            user32.DestroyIcon(icon)
+
+
+# ---------------------------------------------------------------------------
 # The overlay window
 # ---------------------------------------------------------------------------
 
@@ -961,6 +1245,7 @@ class Overlay(tk.Tk):
         self._ghost_applied = False
         self._chord_down = False
         self._hint_until = 0.0
+        self._hidden = False
 
         self.title(APP_NAME)
         self.overrideredirect(True)
@@ -986,6 +1271,12 @@ class Overlay(tk.Tk):
         self.bind_all("<Escape>", lambda _e: self.shutdown())
 
         self.reconcile_startup()
+
+        self.tray = None
+        if IS_WINDOWS and self.cfg.get("tray_icon", True):
+            self.tray = TrayIcon(self.tray_state)
+            self.tray.start()
+            self.after(100, self.drain_tray)
 
         self.after(120, self.tick)
         self.after(400, self.guard_click_through)
@@ -1024,8 +1315,9 @@ class Overlay(tk.Tk):
                 self._ghost_applied = want_ghost
                 self.withdraw()
                 self.update_idletasks()
-                self.deiconify()
-                self.attributes("-topmost", True)
+                if not self._hidden:
+                    self.deiconify()
+                    self.attributes("-topmost", True)
             except tk.TclError:
                 pass
         for label_widget, value_widget in self.widgets.values():
@@ -1123,7 +1415,7 @@ class Overlay(tk.Tk):
         also covers a display disappearing while the panel is running.
         """
         try:
-            if self._drag is None:
+            if self._drag is None and not self._hidden:
                 x, y = self.winfo_x(), self.winfo_y()
                 new_x, new_y = visible_origin(
                     x, y, self.winfo_width(), self.winfo_height()
@@ -1151,6 +1443,8 @@ class Overlay(tk.Tk):
         self.sampler.update_config(self.cfg)
         self.apply_style()
         self.signature = ()          # force a rebuild
+        if self.tray:
+            self.tray.refresh()
 
     def toggle_metric(self, key: str) -> None:
         metrics = list(self.cfg.get("metrics", []))
@@ -1264,6 +1558,53 @@ class Overlay(tk.Tk):
                           not self.cfg.get("click_through", False))
         self.flash_hint()
 
+    # -- tray icon ---------------------------------------------------------
+
+    def tray_state(self) -> dict:
+        """Read-only snapshot for the tray thread, which must not touch Tk."""
+        return {
+            "click_through": bool(self.cfg.get("click_through", False)),
+            "locked": bool(self.cfg.get("locked", False)),
+            "hidden": self._hidden,
+            "startup": startup_enabled() if IS_WINDOWS else None,
+            "letter": str(self.cfg.get("click_through_hotkey", "G"))[:1].upper() or "G",
+        }
+
+    def drain_tray(self) -> None:
+        """Run tray commands on the Tk thread."""
+        handlers = {
+            TRAY_TOGGLE: self.toggle_click_through,
+            TRAY_LOCK: lambda: self.set_and_save(
+                ["locked"], not self.cfg.get("locked", False)),
+            TRAY_SHOW: self.toggle_visible,
+            TRAY_STARTUP: self.toggle_startup,
+            TRAY_CONFIG: self.open_config,
+            TRAY_RELOAD: self.reload_config,
+        }
+        while True:
+            try:
+                cmd = self.tray.commands.get_nowait()
+            except queue.Empty:
+                break
+            if cmd == TRAY_QUIT:
+                self.shutdown()
+                return
+            handler = handlers.get(cmd)
+            if handler:
+                handler()
+        self.after(100, self.drain_tray)
+
+    def toggle_visible(self) -> None:
+        self._hidden = not self._hidden
+        if self._hidden:
+            self.withdraw()
+        else:
+            self.deiconify()
+            self.attributes("-topmost", True)
+            self._click_through_live = None   # force the ex-style to be re-applied
+        if self.tray:
+            self.tray.refresh()
+
     def open_config(self) -> None:
         try:
             os.startfile(CONFIG_PATH)  # noqa: S606 - user-initiated, local file
@@ -1275,11 +1616,16 @@ class Overlay(tk.Tk):
         self.sampler.update_config(self.cfg)
         self.apply_style()
         self.signature = ()
+        if self.tray:
+            self.tray.refresh()
 
     def shutdown(self) -> None:
-        self.cfg["position"] = {"x": self.winfo_x(), "y": self.winfo_y()}
+        if not self._hidden:
+            self.cfg["position"] = {"x": self.winfo_x(), "y": self.winfo_y()}
         self.persist()
         self.sampler.stop()
+        if self.tray:
+            self.tray.stop()
         self.destroy()
 
     # -- row construction --------------------------------------------------
@@ -1304,7 +1650,7 @@ class Overlay(tk.Tk):
             letter = str(self.cfg.get("click_through_hotkey", "G"))[:1].upper()
             state = "ON" if self.cfg.get("click_through") else "OFF"
             rows.append(Row("hint", f"click-through {state}",
-                            f"Ctrl+Shift+{letter}", "warn"))
+                            f"Ctrl+Shift+{letter} / tray", "warn"))
 
         if snapshot.get("error"):
             rows.append(Row("err", "GPU", snapshot["error"], "crit"))

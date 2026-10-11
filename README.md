@@ -93,8 +93,9 @@ the shortcut again on its next launch.
 | Move | Left-click drag anywhere on the panel |
 | Menu | Right-click the panel |
 | Quit | Right-click then Quit, or press Esc |
-| Toggle click-through | Ctrl+Shift+G, from anywhere |
+| Toggle click-through | Ctrl+Shift+G from anywhere, or left-click the tray icon |
 | Temporarily grab the mouse back | Hold Ctrl+Shift |
+| Tray menu | Right-click the tray icon |
 
 Position, opacity, metric selection and every other setting persist to
 `config.json` as soon as they change.
@@ -103,8 +104,15 @@ Position, opacity, metric selection and every other setting persist to
 
 With click-through enabled the panel ignores the mouse entirely and clicks land
 on whatever is behind it. That also means it cannot be right-clicked to turn the
-mode off, so there are two ways back, neither of which needs the window to
+mode off, so there are three ways back, none of which needs the window to
 receive input:
+
+- **The tray icon** in the notification area. Left-click toggles click-through;
+  right-click opens a menu with click-through, lock position, show/hide, start
+  with Windows, config and quit. The icon's bars are green while the panel takes
+  the mouse, amber while click-through is on and gray while the panel is hidden.
+  Turn it off with `"tray_icon": false`. If Windows tucks it into the overflow
+  flyout, drag it onto the taskbar to keep it visible.
 
 - **Ctrl+Shift+G** toggles the mode outright, from anywhere. Change the letter
   with `click_through_hotkey` in the config.
