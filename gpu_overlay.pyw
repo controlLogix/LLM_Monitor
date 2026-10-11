@@ -857,6 +857,90 @@ def grade(value, warn, crit) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Monitor geometry - keep the panel on a display that actually exists
+# ---------------------------------------------------------------------------
+
+MONITOR_DEFAULTTONULL = 0
+MONITOR_DEFAULTTONEAREST = 2
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long)]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long),
+                ("y", ctypes.c_long)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint32),
+                ("rcMonitor", _RECT),
+                ("rcWork", _RECT),
+                ("dwFlags", ctypes.c_uint32)]
+
+
+def _work_area_for_point(x: int, y: int, flag: int):
+    """Work area of the monitor under (x, y), or None when there is none."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        user32.MonitorFromPoint.argtypes = [_POINT, ctypes.c_uint32]
+        handle = user32.MonitorFromPoint(_POINT(int(x), int(y)), flag)
+        if not handle:
+            return None
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        if not user32.GetMonitorInfoW(ctypes.c_void_p(handle), ctypes.byref(info)):
+            return None
+        r = info.rcWork
+        return (r.left, r.top, r.right, r.bottom)
+    except Exception:
+        return None
+
+
+def visible_origin(x, y, w, h):
+    """
+    Clamp a saved window origin back onto a monitor that exists today.
+
+    The panel is reachable when a grab point just inside its top-left corner
+    lands on a real display. Monitors can be laid out with gaps, so a plain
+    virtual-desktop bounds check is not enough - MonitorFromPoint answers the
+    question properly. When the point is orphaned (the display it lived on was
+    unplugged, or the layout shrank) fall back to the nearest monitor's work
+    area, which is what the user can actually see.
+    """
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    probe_x = x + min(40, max(1, w // 2))
+    probe_y = y + min(20, max(1, h // 2))
+
+    # Prefer the monitor the panel is already on; only when that point is
+    # orphaned do we go hunting for the nearest one. Either way the panel is
+    # then clamped to fit entirely inside that monitor's work area, so a
+    # position that is merely clipped gets corrected too - not just one that
+    # is completely off the desktop.
+    area = _work_area_for_point(probe_x, probe_y, MONITOR_DEFAULTTONULL)
+    if area is None:
+        area = _work_area_for_point(probe_x, probe_y, MONITOR_DEFAULTTONEAREST)
+    if area is None:
+        fallback = DEFAULT_CONFIG["position"]
+        return int(fallback["x"]), int(fallback["y"])
+
+    left, top, right, bottom = area
+    # When the panel is larger than the display, favour the top-left corner so
+    # the drag area stays reachable.
+    new_x = min(max(x, left), max(left, right - w))
+    new_y = min(max(y, top), max(top, bottom - h))
+    return new_x, new_y
+
+
+# ---------------------------------------------------------------------------
 # The overlay window
 # ---------------------------------------------------------------------------
 
@@ -887,7 +971,13 @@ class Overlay(tk.Tk):
 
         self.apply_style()
         pos = self.cfg.get("position", {})
-        self.geometry(f"+{int(pos.get('x', 60))}+{int(pos.get('y', 60))}")
+        start_x, start_y = visible_origin(
+            pos.get("x", DEFAULT_CONFIG["position"]["x"]),
+            pos.get("y", DEFAULT_CONFIG["position"]["y"]),
+            self.winfo_reqwidth(),
+            self.winfo_reqheight(),
+        )
+        self.geometry(f"+{start_x}+{start_y}")
 
         self.bind_all("<Button-1>", self.on_press, add="+")
         self.bind_all("<B1-Motion>", self.on_drag, add="+")
@@ -900,6 +990,7 @@ class Overlay(tk.Tk):
         self.after(120, self.tick)
         self.after(400, self.guard_click_through)
         self.after(200, self.assert_on_top)
+        self.after(600, self.ensure_on_screen)
 
     # -- appearance --------------------------------------------------------
 
@@ -1020,6 +1111,30 @@ class Overlay(tk.Tk):
         self._drag = None
         self.cfg["position"] = {"x": self.winfo_x(), "y": self.winfo_y()}
         self.persist()
+
+    def ensure_on_screen(self) -> None:
+        """
+        Re-clamp once the panel has its real size, then keep watching.
+
+        A saved position outlives the monitor it was saved on: unplug a display
+        or rearrange the layout and the overlay restores to coordinates that no
+        longer exist. It is then alive, on top and completely invisible, which
+        reads as "it stopped starting with the machine". Checking on a timer
+        also covers a display disappearing while the panel is running.
+        """
+        try:
+            if self._drag is None:
+                x, y = self.winfo_x(), self.winfo_y()
+                new_x, new_y = visible_origin(
+                    x, y, self.winfo_width(), self.winfo_height()
+                )
+                if (new_x, new_y) != (x, y):
+                    self.geometry(f"+{new_x}+{new_y}")
+                    self.cfg["position"] = {"x": new_x, "y": new_y}
+                    self.persist()
+        except Exception:
+            pass
+        self.after(5000, self.ensure_on_screen)
 
     def persist(self) -> None:
         try:
